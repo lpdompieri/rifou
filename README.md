@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # RIFOU — App de Rifas
 
 Aplicação web do RIFOU em Next.js, com o fluxo público de participação e a área autenticada do organizador.
@@ -60,3 +61,7 @@ Aplicação web do RIFOU em Next.js, com o fluxo público de participação e a 
 O login do organizador, a recuperação de senha e as APIs do painel usam Cognito e AWS. O QR code e o código Pix desta etapa são demonstrativos e não aceitam pagamentos. A confirmação manual permite concluir testes da jornada enquanto a integração com um parceiro pagador não existe.
 
 O organizador pode conduzir o sorteio na seção “Sorteios” depois da data prevista, quando não houver reservas pendentes e existir pelo menos um número com pagamento confirmado. O resultado fica registrado na rifa e aparece no histórico público com o número sorteado, o primeiro nome e a inicial do sobrenome do ganhador, além da data e hora.
+=======
+# rifou
+APP de Rifa
+>>>>>>> ab194412a9b5ef44cda37d7054fa3fc982c1f600
