@@ -1,0 +1,1089 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: API pública e painel do RIFOU — organiza rifas por proprietário Cognito e consulta o DynamoDB por índices.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: Next.js BFF -> HTTP API JWT -> Lambdas -> DynamoDB; Cognito administra os organizadores e o índice por sub isola as rifas.
+    must:
+      - Respostas públicas não podem incluir dados pessoais de participantes.
+      - Transação, estados dos números e contador de reservas devem gravar ou falhar juntos.
+      - Confirmação manual só pode converter uma reserva PENDING ainda válida; pedido, números e contadores mudam atomicamente.
+      - Pix gerado por esta stack é fictício e não pode ser apresentado como cobrança válida.
+      - O bucket de imagens permanece privado; imagens públicas são entregues somente pelo CloudFront com OAC.
+      - A seleção de destaque é global e única enquanto o produto opera com um único cliente.
+      - O valor do prêmio deve ser igual ao preço unitário multiplicado pela quantidade de números.
+      - Ações mutáveis do organizador devem registrar auditoria e gravar histórico junto com a alteração de negócio.
+      - Organizadores só consultam seus próprios chamados de suporte e eventos de auditoria.
+      - Permissões de transações DynamoDB devem autorizar as operações internas por tabela (PutItem, UpdateItem e ConditionCheckItem quando usadas).
+      - O User Pool aceita usuários criados por administradores; solicitações públicas de acesso não criam contas automaticamente.
+      - Solicitações de acesso podem conter dados pessoais; não registrar contato em logs nem retorná-lo ao cliente público.
+    ref:
+      - at: README.md
+        has: contratos de rotas públicas/autenticadas, isolamento por organizador e invariantes das operações
+        scope: backend
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Ambiente usado no nome dos recursos.
+  AllowedOrigin:
+    Type: String
+    Default: http://localhost:3000
+    Description: Origem web autorizada para upload direto de imagem e CORS da API.
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Timeout: 10
+    MemorySize: 128
+
+Resources:
+  RafflesApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: !Sub rifou-api-${EnvironmentName}
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - PUT
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+          - authorization
+        MaxAge: 600
+      Auth:
+        Authorizers:
+          OrganizerJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${OrganizerUserPool}
+              audience:
+                - !Ref OrganizerUserPoolClient
+
+  OrganizerUserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub rifou-organizers-${EnvironmentName}
+      DeletionProtection: ACTIVE
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: Acesso ao painel do RIFOU
+          EmailMessage: 'Olá! Seu acesso ao painel RIFOU foi aprovado. Usuário: {username}. Senha temporária: {####}. Acesse o painel para definir sua senha pessoal.'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+
+  OrganizerUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref OrganizerUserPool
+      ClientName: !Sub rifou-organizer-bff-${EnvironmentName}
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+      EnableTokenRevocation: true
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 7
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      RefreshTokenRotation:
+        Feature: ENABLED
+        RetryGracePeriodSeconds: 30
+
+  RafflesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub rifou-raffles-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: raffleId
+          AttributeType: S
+        - AttributeName: publicStatus
+          AttributeType: S
+        - AttributeName: featuredStatus
+          AttributeType: S
+        - AttributeName: sortOrder
+          AttributeType: N
+        - AttributeName: organizerSub
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: completionStatus
+          AttributeType: S
+        - AttributeName: completionAtEpoch
+          AttributeType: N
+      KeySchema:
+        - AttributeName: raffleId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: PublicRafflesIndex
+          KeySchema:
+            - AttributeName: publicStatus
+              KeyType: HASH
+            - AttributeName: sortOrder
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: FeaturedRafflesIndex
+          KeySchema:
+            - AttributeName: featuredStatus
+              KeyType: HASH
+            - AttributeName: sortOrder
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: OrganizerRafflesByOwnerIndex
+          KeySchema:
+            - AttributeName: organizerSub
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: RafflesByCompletionIndex
+          KeySchema:
+            - AttributeName: completionStatus
+              KeyType: HASH
+            - AttributeName: completionAtEpoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  RaffleAppConfigTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Guarda a seleção global da rifa em destaque separada dos dados do organizador; a condição transacional impede duas rifas destacadas ao mesmo tempo.
+        must:
+          - A chave HOME_FEATURED_RAFFLE pode apontar somente para uma rifa ativa.
+          - Somente a Lambda autenticada de gestão altera esta tabela.
+    Properties:
+      TableName: !Sub rifou-app-config-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: configKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: configKey
+          KeyType: HASH
+
+  RaffleImagesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Armazena imagens enviadas pelos organizadores em bucket privado; leitura pública ocorre pela distribuição CloudFront e gravação usa POST assinado de curta duração.
+        must:
+          - Todo acesso público direto ao bucket permanece bloqueado.
+          - Apenas CloudFront OAC lê imagens e apenas a Lambda autenticada emite permissões de gravação.
+          - HTTPS obrigatório e criptografia padrão SSE-S3 habilitada.
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Ref AllowedOrigin
+            AllowedMethods:
+              - POST
+            AllowedHeaders:
+              - '*'
+            MaxAge: 3600
+
+  RaffleImagesOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Assina requisições CloudFront para o bucket privado e mantém a origem S3 fora do acesso público.
+        must:
+          - SigningBehavior permanece always e SigningProtocol permanece sigv4.
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub rifou-images-oac-${EnvironmentName}
+        Description: Acesso privado do CloudFront às imagens do RIFOU.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  RaffleImagesCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub rifou-images-cache-${EnvironmentName}
+        Comment: Cache de imagens imutáveis do catálogo público do RIFOU.
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+
+  RaffleImagesDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Serve imagens públicas com cache e HTTPS sem tornar o bucket S3 público.
+        must:
+          - A origem é o bucket regional privado e usa RaffleImagesOriginAccessControl.
+          - Visualizadores recebem somente GET e HEAD por HTTPS.
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub RIFOU public raffle images ${EnvironmentName}
+        PriceClass: PriceClass_All
+        Origins:
+          - Id: RaffleImagesS3Origin
+            DomainName: !GetAtt RaffleImagesBucket.RegionalDomainName
+            OriginAccessControlId: !Ref RaffleImagesOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: RaffleImagesS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: !Ref RaffleImagesCachePolicy
+          Compress: true
+        HttpVersion: http2and3
+
+  RaffleImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RaffleImagesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt RaffleImagesBucket.Arn
+              - !Sub '${RaffleImagesBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: AllowCloudFrontReadRaffleImages
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action:
+              - s3:GetObject
+            Resource: !Sub '${RaffleImagesBucket.Arn}/raffle-images/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${RaffleImagesDistribution}'
+  RaffleNumbersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub rifou-raffle-numbers-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: raffleId
+          AttributeType: S
+        - AttributeName: number
+          AttributeType: N
+      KeySchema:
+        - AttributeName: raffleId
+          KeyType: HASH
+        - AttributeName: number
+          KeyType: RANGE
+
+  RaffleTransactionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub rifou-raffle-transactions-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: transactionId
+          AttributeType: S
+        - AttributeName: raffleId
+          AttributeType: S
+        - AttributeName: createdAtEpoch
+          AttributeType: N
+        - AttributeName: pendingStatus
+          AttributeType: S
+        - AttributeName: expiresAtEpoch
+          AttributeType: N
+      KeySchema:
+        - AttributeName: transactionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: RaffleTransactionsByCreatedAtIndex
+          KeySchema:
+            - AttributeName: raffleId
+              KeyType: HASH
+            - AttributeName: createdAtEpoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
+        - IndexName: PendingPixOrdersByExpiryIndex
+          KeySchema:
+            - AttributeName: pendingStatus
+              KeyType: HASH
+            - AttributeName: expiresAtEpoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - raffleId
+              - numbers
+
+  RaffleParticipantLimitsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub rifou-raffle-participant-limits-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: raffleId
+          AttributeType: S
+        - AttributeName: participantId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: raffleId
+          KeyType: HASH
+        - AttributeName: participantId
+          KeyType: RANGE
+
+  RaffleAuditEventsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Registro imutável das ações do organizador; índices permitem consultar a trilha por conta ou por rifa sem Scan.
+        must:
+          - Eventos são gravados pela Lambda autenticada e junto com a alteração de negócio na mesma transação.
+          - A API do organizador permite consultar somente eventos da própria conta.
+    Properties:
+      TableName: !Sub rifou-audit-events-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: auditId
+          AttributeType: S
+        - AttributeName: organizerSub
+          AttributeType: S
+        - AttributeName: raffleId
+          AttributeType: S
+        - AttributeName: occurredAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: auditId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OrganizerAuditEventsIndex
+          KeySchema:
+            - AttributeName: organizerSub
+              KeyType: HASH
+            - AttributeName: occurredAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: RaffleAuditEventsIndex
+          KeySchema:
+            - AttributeName: raffleId
+              KeyType: HASH
+            - AttributeName: occurredAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  OrganizerSupportTicketsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Guarda chamados enviados pelo painel e seu status para o organizador acompanhar o protocolo.
+        must:
+          - Cada chamado pertence a um sub do Cognito e nunca pode ser listado por outro organizador.
+          - O conteúdo do chamado não deve ser retornado por APIs públicas nem escrito em logs.
+    Properties:
+      TableName: !Sub rifou-support-tickets-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+        - AttributeName: organizerSub
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OrganizerSupportTicketsIndex
+          KeySchema:
+            - AttributeName: organizerSub
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ParticipantLimitHashSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub rifou-participant-limit-hmac-${EnvironmentName}
+      Description: Chave estável para gerar identificadores HMAC de telefone usados nos limites de compra por rifa.
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  OrganizerAccessRequestsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub rifou-organizer-access-requests-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: requestId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: requestId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AccessRequestsByStatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  GetRafflesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rifou-get-raffles-${EnvironmentName}
+      CodeUri: src/functions/get-raffles/
+      Handler: index.handler
+      Environment:
+        Variables:
+          RAFFLES_TABLE: !Ref RafflesTable
+          PUBLIC_RAFFLES_INDEX: PublicRafflesIndex
+          FEATURED_RAFFLES_INDEX: FeaturedRafflesIndex
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: QueryPublicRaffleIndexes
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !Sub '${RafflesTable.Arn}/index/PublicRafflesIndex'
+                - !Sub '${RafflesTable.Arn}/index/FeaturedRafflesIndex'
+      Events:
+        ListActiveRaffles:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/raffles
+            Method: GET
+
+  OrganizerRafflesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rifou-organizer-raffles-${EnvironmentName}
+      CodeUri: src/functions/organizer-raffles/
+      Handler: index.handler
+      Timeout: 20
+      MemorySize: 256
+      Environment:
+        Variables:
+          RAFFLES_TABLE: !Ref RafflesTable
+          RAFFLE_TRANSACTIONS_TABLE: !Ref RaffleTransactionsTable
+          RAFFLE_NUMBERS_TABLE: !Ref RaffleNumbersTable
+          APP_CONFIG_TABLE: !Ref RaffleAppConfigTable
+          AUDIT_EVENTS_TABLE: !Ref RaffleAuditEventsTable
+          ORGANIZER_SUPPORT_TICKETS_TABLE: !Ref OrganizerSupportTicketsTable
+          ORGANIZER_RAFFLES_INDEX: OrganizerRafflesByOwnerIndex
+          RAFFLE_TRANSACTIONS_INDEX: RaffleTransactionsByCreatedAtIndex
+          FEATURED_RAFFLES_INDEX: FeaturedRafflesIndex
+          RAFFLE_IMAGES_BUCKET: !Ref RaffleImagesBucket
+          RAFFLE_IMAGES_PUBLIC_BASE_URL: !Sub 'https://${RaffleImagesDistribution.DomainName}'
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: QueryRafflesOwnedByOrganizer
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${RafflesTable.Arn}/index/OrganizerRafflesByOwnerIndex'
+            - Sid: ManageOwnedRaffles
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:BatchGetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt RafflesTable.Arn
+            - Sid: FindCurrentHomeFeaturedRaffles
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${RafflesTable.Arn}/index/FeaturedRafflesIndex'
+            - Sid: ManageHomeFeaturedRaffleConfig
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt RaffleAppConfigTable.Arn
+            - Sid: PresignOrganizerRaffleImageUploads
+              Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub '${RaffleImagesBucket.Arn}/raffle-images/*'
+            - Sid: QueryOwnedRaffleTransactions
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${RaffleTransactionsTable.Arn}/index/RaffleTransactionsByCreatedAtIndex'
+            - Sid: ManageOrganizerVisibleTransactions
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:BatchGetItem
+                - dynamodb:UpdateItem
+                - dynamodb:ConditionCheckItem
+              Resource: !GetAtt RaffleTransactionsTable.Arn
+            - Sid: WriteOrganizerAuditEvents
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt RaffleAuditEventsTable.Arn
+            - Sid: QueryOrganizerAuditEventsByOwner
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${RaffleAuditEventsTable.Arn}/index/OrganizerAuditEventsIndex'
+            - Sid: QueryOrganizerAuditEventsByRaffle
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${RaffleAuditEventsTable.Arn}/index/RaffleAuditEventsIndex'
+            - Sid: WriteOrganizerSupportTickets
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt OrganizerSupportTicketsTable.Arn
+            - Sid: QueryOrganizerSupportTickets
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${OrganizerSupportTicketsTable.Arn}/index/OrganizerSupportTicketsIndex'
+            - Sid: ManageConfirmedRaffleNumberParticipation
+              Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+                - dynamodb:ConditionCheckItem
+              Resource: !GetAtt RaffleNumbersTable.Arn
+      Events:
+        GetOrganizerDashboard:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/dashboard
+            Method: GET
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        GetOrganizerFinance:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/finance
+            Method: GET
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        GetOrganizerRaffleSettings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/settings/raffles
+            Method: GET
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        UpdateOrganizerRaffleSettings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/settings/raffles
+            Method: PUT
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        ListOrganizerRaffles:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/raffles
+            Method: GET
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        CreateOrganizerRaffle:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/raffles
+            Method: POST
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        GetOrganizerRaffle:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/raffles/{raffleId}
+            Method: GET
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        UpdateOrganizerRaffle:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/raffles/{raffleId}
+            Method: PATCH
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        DrawOrganizerRaffle:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/raffles/{raffleId}/draw
+            Method: POST
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        ListOrganizerRaffleTransactions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/raffles/{raffleId}/transactions
+            Method: GET
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        ConfirmOrganizerRaffleTransactionPayment:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/raffles/{raffleId}/transactions/{transactionId}/confirm
+            Method: POST
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        ListOrganizerAuditEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/audit
+            Method: GET
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        ListOrganizerSupportTickets:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/support-tickets
+            Method: GET
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        CreateOrganizerSupportTicket:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/support-tickets
+            Method: POST
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        CreateOrganizerRaffleImageUpload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/raffle-images/upload-url
+            Method: POST
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+        SetHomeFeaturedRaffle:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/home-featured-raffle
+            Method: PUT
+            Auth:
+              Authorizer: OrganizerJwtAuthorizer
+
+  GetRaffleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rifou-get-raffle-${EnvironmentName}
+      CodeUri: src/functions/get-raffle/
+      Handler: index.handler
+      Environment:
+        Variables:
+          RAFFLES_TABLE: !Ref RafflesTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadPublicRaffle
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt RafflesTable.Arn
+      Events:
+        GetActiveRaffle:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/raffles/{raffleId}
+            Method: GET
+
+  GetRaffleNumbersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rifou-get-raffle-numbers-${EnvironmentName}
+      CodeUri: src/functions/get-raffle-numbers/
+      Handler: index.handler
+      Environment:
+        Variables:
+          RAFFLES_TABLE: !Ref RafflesTable
+          RAFFLE_NUMBERS_TABLE: !Ref RaffleNumbersTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadPublicRaffleForNumbers
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt RafflesTable.Arn
+            - Sid: QueryRaffleNumberRange
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !GetAtt RaffleNumbersTable.Arn
+      Events:
+        GetActiveRaffleNumbers:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/raffles/{raffleId}/numbers
+            Method: GET
+
+  CreatePixOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rifou-create-pix-order-${EnvironmentName}
+      CodeUri: src/functions/create-pix-order/
+      Handler: index.handler
+      Environment:
+        Variables:
+          RAFFLES_TABLE: !Ref RafflesTable
+          RAFFLE_NUMBERS_TABLE: !Ref RaffleNumbersTable
+          RAFFLE_TRANSACTIONS_TABLE: !Ref RaffleTransactionsTable
+          PARTICIPANT_LIMITS_TABLE: !Ref RaffleParticipantLimitsTable
+          PARTICIPANT_LIMIT_HASH_SECRET_ARN: !Ref ParticipantLimitHashSecret
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadRaffleToPricePixOrder
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt RafflesTable.Arn
+            - Sid: CreatePixOrderRecord
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt RaffleTransactionsTable.Arn
+            - Sid: ReserveRaffleNumbersAndIncrementCount
+              Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt RafflesTable.Arn
+                - !GetAtt RaffleNumbersTable.Arn
+            - Sid: EnforcePerParticipantRaffleLimit
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt RaffleParticipantLimitsTable.Arn
+            - Sid: ReadParticipantLimitHashSecret
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref ParticipantLimitHashSecret
+      Events:
+        CreateFakePixOrder:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/raffles/{raffleId}/pix-orders
+            Method: POST
+
+  CreateOrganizerAccessRequestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rifou-create-organizer-access-request-${EnvironmentName}
+      CodeUri: src/functions/create-organizer-access-request/
+      Handler: index.handler
+      Environment:
+        Variables:
+          ACCESS_REQUESTS_TABLE: !Ref OrganizerAccessRequestsTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: CreateOrganizerAccessRequest
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt OrganizerAccessRequestsTable.Arn
+      Events:
+        CreateOrganizerAccessRequest:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref RafflesApi
+            Path: /api/v1/organizer/access-requests
+            Method: POST
+
+  ExpirePixOrdersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rifou-expire-pix-orders-${EnvironmentName}
+      CodeUri: src/functions/expire-pix-orders/
+      Handler: index.handler
+      Environment:
+        Variables:
+          RAFFLES_TABLE: !Ref RafflesTable
+          RAFFLE_NUMBERS_TABLE: !Ref RaffleNumbersTable
+          RAFFLE_TRANSACTIONS_TABLE: !Ref RaffleTransactionsTable
+          PARTICIPANT_LIMITS_TABLE: !Ref RaffleParticipantLimitsTable
+          PENDING_ORDERS_INDEX: PendingPixOrdersByExpiryIndex
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: FindExpiredPixOrders
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub '${RaffleTransactionsTable.Arn}/index/PendingPixOrdersByExpiryIndex'
+            - Sid: ReadExpiredPixOrderDetails
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt RaffleTransactionsTable.Arn
+            - Sid: ReleaseExpiredReservationsAtomically
+              Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt RafflesTable.Arn
+                - !GetAtt RaffleNumbersTable.Arn
+                - !GetAtt RaffleTransactionsTable.Arn
+                - !GetAtt RaffleParticipantLimitsTable.Arn
+      Events:
+        ExpirePendingPixOrders:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 minute)
+            Name: !Sub rifou-expire-pix-orders-${EnvironmentName}
+            Description: Libera números de pedidos Pix demonstrativos expirados.
+            Input: '{}'
+            DeadLetterConfig:
+              Type: SQS
+            RetryPolicy:
+              MaximumEventAgeInSeconds: 3600
+              MaximumRetryAttempts: 2
+
+  CompleteDrawnRafflesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub rifou-complete-drawn-raffles-${EnvironmentName}
+      CodeUri: src/functions/complete-drawn-raffles/
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          RAFFLES_TABLE: !Ref RafflesTable
+          APP_CONFIG_TABLE: !Ref RaffleAppConfigTable
+          AUDIT_EVENTS_TABLE: !Ref RaffleAuditEventsTable
+          COMPLETION_INDEX: RafflesByCompletionIndex
+          PUBLIC_RAFFLES_INDEX: PublicRafflesIndex
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: FindRafflesReadyToComplete
+              Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource:
+                - !Sub '${RafflesTable.Arn}/index/RafflesByCompletionIndex'
+                - !Sub '${RafflesTable.Arn}/index/PublicRafflesIndex'
+            - Sid: ReadCompletionSettings
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt RaffleAppConfigTable.Arn
+            - Sid: CompleteDrawnRaffles
+              Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !GetAtt RafflesTable.Arn
+            - Sid: RecordAutomaticCompletions
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt RaffleAuditEventsTable.Arn
+      Events:
+        CompleteDueDrawnRaffles:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 hour)
+            Name: !Sub rifou-complete-drawn-raffles-${EnvironmentName}
+            Description: Oculta rifas sorteadas após o prazo configurado pelo organizador.
+            Input: '{}'
+            DeadLetterConfig:
+              Type: SQS
+            RetryPolicy:
+              MaximumEventAgeInSeconds: 3600
+              MaximumRetryAttempts: 2
+
+Outputs:
+  RafflesApiUrl:
+    Description: URL publica da API de rifas.
+    Value: !Sub https://${RafflesApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/api/v1/raffles
+  RafflesTableName:
+    Description: Nome da tabela DynamoDB de rifas.
+    Value: !Ref RafflesTable
+  GetRafflesFunctionName:
+    Description: Nome da Lambda que lista rifas.
+    Value: !Ref GetRafflesFunction
+  RaffleNumbersTableName:
+    Description: Nome da tabela DynamoDB que armazena o status de cada número.
+    Value: !Ref RaffleNumbersTable
+  GetRaffleFunctionName:
+    Description: Nome da Lambda que consulta uma rifa.
+    Value: !Ref GetRaffleFunction
+  GetRaffleNumbersFunctionName:
+    Description: Nome da Lambda que consulta a disponibilidade dos números.
+    Value: !Ref GetRaffleNumbersFunction
+  RaffleTransactionsTableName:
+    Description: Nome da tabela DynamoDB de pedidos Pix demonstrativos.
+    Value: !Ref RaffleTransactionsTable
+  RaffleParticipantLimitsTableName:
+    Description: Nome da tabela que controla cotas por telefone e por rifa.
+    Value: !Ref RaffleParticipantLimitsTable
+  CreatePixOrderFunctionName:
+    Description: Nome da Lambda que cria o pedido demonstrativo e reserva os números.
+    Value: !Ref CreatePixOrderFunction
+  ExpirePixOrdersFunctionName:
+    Description: Nome da Lambda que libera reservas demonstrativas expiradas.
+    Value: !Ref ExpirePixOrdersFunction
+  CompleteDrawnRafflesFunctionName:
+    Description: Nome da Lambda que conclui rifas após o prazo configurado.
+    Value: !Ref CompleteDrawnRafflesFunction
+  OrganizerAccessRequestsTableName:
+    Description: Nome da tabela DynamoDB de solicitações de acesso ao painel.
+    Value: !Ref OrganizerAccessRequestsTable
+  CreateOrganizerAccessRequestFunctionName:
+    Description: Nome da Lambda que registra solicitações de acesso ao painel.
+    Value: !Ref CreateOrganizerAccessRequestFunction
+  OrganizerUserPoolId:
+    Description: ID do User Pool Cognito dedicado aos organizadores do RIFOU.
+    Value: !Ref OrganizerUserPool
+  OrganizerUserPoolClientId:
+    Description: ID do app client Cognito usado pelo BFF do RIFOU.
+    Value: !Ref OrganizerUserPoolClient
+  OrganizerRafflesFunctionName:
+    Description: Nome da Lambda autenticada de dashboard e gestão de rifas.
+    Value: !Ref OrganizerRafflesFunction
+  RaffleImagesBucketName:
+    Description: Nome do bucket privado das imagens enviadas aos prêmios.
+    Value: !Ref RaffleImagesBucket
+  RaffleImagesDistributionDomain:
+    Description: Domínio público do CloudFront para servir imagens das rifas.
+    Value: !GetAtt RaffleImagesDistribution.DomainName
+  RaffleAppConfigTableName:
+    Description: Nome da tabela com a seleção global de destaque da home.
+    Value: !Ref RaffleAppConfigTable

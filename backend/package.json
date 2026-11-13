@@ -1,0 +1,12 @@
+{
+  "name": "rifou-backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "seed:dev": "node scripts/seed-raffles.mjs --table-name rifou-raffles-dev --numbers-table-name rifou-raffle-numbers-dev"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0"
+  }
+}

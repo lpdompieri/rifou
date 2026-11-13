@@ -1,0 +1,16 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "rifou-app"
+resolve_s3 = true
+s3_prefix = "rifou-app"
+region = "sa-east-1"
+profile = "rifou-dev"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+parameter_overrides = "EnvironmentName=\"dev\" AllowedOrigin=\"http://localhost:3000\""
+image_repositories = []
+
+[default.global.parameters]
+region = "sa-east-1"

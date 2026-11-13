@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.vite/
+.next/
+.env.local
+.env.*.local
+.aws-sam/
+.DS_Store
+Thumbs.db
